@@ -1,6 +1,6 @@
-# EELo-COT
+# EELo-CoT
 
-This repository contains code for performing EELo-COT in a language model during text generation. The system allows configuring different types of intervention functions through a JSON configuration file.
+This repository contains code for performing EELo-CoT in a language model during text generation. The system allows configuring different types of intervention functions through a JSON configuration file.
 
 ## Environment
 install Python 3.10.16  
