@@ -4,11 +4,8 @@ This repository contains code for performing EELo-COT in a language model during
 
 ## Environment
 install Python 3.10.16
-
-install Transformer 4.51.3
-
-install Pytorch 2.7.0
 ```python
+pip install torch==2.7.0 torchvision==0.18.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu121
 pip install transformers==4.51.3
 ```
 
