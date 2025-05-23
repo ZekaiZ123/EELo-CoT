@@ -24,15 +24,15 @@ pip install transformers==4.51.3
 First create a grid1 folder under the configs folder.
 Then, run 
 ```python
-python EELo-CoT/gpqa/raasoning_probing_vllm-main_multi_layer/create_grid.py
+python EELo-CoT/gpqa/reasoing_probing_vllm-main_rule/create_grid.py
 ```
 
 Finally, run 
 ```python
-python EELo-CoT/gpqa/raasoning_probing_vllm-main_multi_layer/inference_probing.py \
-  --config EELo-CoT/gpqa/raasoning_probing_vllm-main_multi_layer/configs/grid1 \
+python EELo-CoT/gpqa/reasoing_probing_vllm-main_rule/inference_probing.py \
+  --config EELo-CoT/gpqa/reasoing_probing_vllm-main_rule/configs/grid1 \
   --num_gpus 7 \
-  --output_dir EELo-CoT/gpqa/raasoning_probing_vllm-main_multi_layer/results
+  --output_dir EELo-CoT/gpqa/reasoing_probing_vllm-main_rule/results
 ```
 
 
