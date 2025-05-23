@@ -1,6 +1,6 @@
 import json
 import copy
-acc_len = [250]
+acc_len = [40]
 ref_factor = [4]
 
 
