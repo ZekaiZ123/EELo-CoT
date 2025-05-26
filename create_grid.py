@@ -1,7 +1,7 @@
 import json
 import copy
 acc_len = [40]
-ref_factor = [2]
+ref_factor = [4]
 
 
 original_config = """{
