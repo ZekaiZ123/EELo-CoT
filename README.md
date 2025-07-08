@@ -30,13 +30,13 @@ pip install transformers==4.51.3
 First create a grid1 folder under the configs folder.
 Then, run 
 ```python
-python create_grid.py
+python Config_Setup.py
 ```
 
 Finally, run 
 ```python
 python inference_probing.py \
-  --config configs/grid1 \
+  --config configs \
   --num_gpus 7 \
   --output_dir results
 ```
