@@ -12,6 +12,8 @@ from transformers import Qwen2ForCausalLM, AutoTokenizer
 import torch.nn.functional as F
 import torch.nn as nn
 from typing import Optional, Union, List
+import random
+import math
 
 from transformers.cache_utils import (
     Cache,
@@ -51,6 +53,15 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
         self.armed = True                  # ready to fire
         self.sentences_since_trigger = 0   # how many sentences have passed since last fire
         self._sentence_cooldown = 4        # require 4 sentences in cooldown
+        self.wait_cyclical_amplitude = kwargs.pop("wait_cyclical_amplitude", 3.0)
+        self.wait_cyclical_period = kwargs.pop("wait_cyclical_period", 100.0)
+        self.wait_cyclical_shift = kwargs.pop("wait_cyclical_shift", 0.0)
+        self.reflection_cooldown = 4
+        self.sentences_since_reflection = self.reflection_cooldown
+        self.recent_sentences = []
+        self.stop_injecting = False  # Flag to stop wait injection after answer
+
+
 
         # Hook & schedule state
         if "intervene_functions" in kwargs:
@@ -62,27 +73,51 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
                 # intervene_function.module = self.model.layers[layer_idx].mlp.act_fn
                 modules = [self.model.layers[i].mlp.act_fn for i in range(28)]
                 intervene_function.modules = modules
+    
+    
+    def _get_initial_cache_position(self, input_ids, model_kwargs):
+        if hasattr(self, "_use_cache") and self._use_cache is False:
+            return model_kwargs
+        if "use_cache" not in model_kwargs:
+            model_kwargs["use_cache"] = True
+        if "cache_position" not in model_kwargs:
+            model_kwargs["cache_position"] = torch.arange(
+                input_ids.shape[1], dtype=torch.long, device=input_ids.device
+            )
+        return model_kwargs
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Override from_pretrained to handle intervention functions properly"""
-        
-        # Store intervene_functions and layer_idx before calling parent method
+        """Override from_pretrained to handle intervention functions and cyclical scheduling properly"""
+
+        # Extract intervene + scheduling params first
         intervene_functions = kwargs.pop("intervene_functions", None)
         layer_idx = kwargs.pop("layer_idx", 27)
-        
-        # Call parent method
+
+        # Extract cyclical parameters safely
+        cyclical_params = {
+            "wait_cyclical_amplitude": kwargs.pop("wait_cyclical_amplitude", 3.0),
+            "wait_cyclical_period": kwargs.pop("wait_cyclical_period", 100.0),
+            "wait_cyclical_shift": kwargs.pop("wait_cyclical_shift", 0.0),
+        }
+
+        # Load model weights using base class
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        
-        # Restore intervene_functions after parent call
+
+        # Assign intervention hooks
         if intervene_functions is not None:
             model.intervene_functions = intervene_functions
-            for intervene_function in model.intervene_functions:
-                # intervene_function.module = model.model.layers[layer_idx].mlp.act_fn
-                modules = [model.model.layers[i].mlp.act_fn for i in range(28)]
+            modules = [model.model.layers[i].mlp.act_fn for i in range(28)]
+            for intervene_function in intervene_functions:
                 intervene_function.modules = modules
-        
+
+        # Assign cyclical schedule parameters
+        model.wait_cyclical_amplitude = cyclical_params["wait_cyclical_amplitude"]
+        model.wait_cyclical_period = cyclical_params["wait_cyclical_period"]
+        model.wait_cyclical_shift = cyclical_params["wait_cyclical_shift"]
+
         return model
+
 
     def _valid_auto_compile_criteria(self, model_kwargs, generation_config):
         return False
@@ -134,94 +169,29 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
 
         # detect end-of-sentence punctuation
         if any(p in tok for p in [".", "!", "?", ":"]):
-            # slice out the just-completed sentence
             slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-            text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
+            text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True).strip()
             digit_count = sum(ch.isdigit() for ch in text_slice)
 
-            if not self.armed:
-                # still cooling down: count this sentence, do NOT fire
-                self.sentences_since_trigger += 1
-                if self.sentences_since_trigger >= self._sentence_cooldown:
-                    # cooldown complete → re-arm
-                    self.armed = True
+            # Avoid injecting on repetitive sentences
+            if text_slice in self.recent_sentences:
+                trigger = False
+            elif self.sentences_since_reflection < self.reflection_cooldown:
+                trigger = False
+            elif digit_count >= min_digits and len(text_slice.split()) > 6:
+                trigger = True
+                self.sentences_since_reflection = 0
+                self.recent_sentences.append(text_slice)
+                self.recent_sentences = self.recent_sentences[-3:]
+            else:
                 trigger = False
 
-            else:
-                # armed → check digit criterion
-                if digit_count > min_digits:
-                    trigger = True
-                    # immediately disarm and reset cooldown counter
-                    self.armed = False
-                    self.sentences_since_trigger = 0
-                else:
-                    trigger = False
-                    # remain armed for next sentence if you prefer
-
-            # advance window start so next slice is correct
-            new_start = cur_idx + 1
-            self.last_period_idx = new_start
-            return trigger, new_start
+            self.sentences_since_reflection += 1
+            self.last_period_idx = cur_idx + 1
+            return trigger, self.last_period_idx
 
         # not a sentence boundary → nothing changes
         return False, self.last_period_idx
-
-    
-    # def check_trigger_from_last_period(
-    #     self,
-    #     token_ids: List[int],
-    #     min_digits: int = 5
-    # ):
-    #     cur_idx = len(token_ids) - 1
-    #     tok = self.tokenizer.decode([token_ids[cur_idx]], skip_special_tokens=True)
-
-    #     # did we just hit end-of-sentence?
-    #     if "." in tok or "!" in tok or "?" in tok or ":" in tok:
-    #         # grab everything since last period (inclusive) up to here
-    #         slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-    #         text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
-    #         digit_count = sum(ch.isdigit() for ch in text_slice)
-
-    #         if self.triggered:
-    #             # we triggered on the previous sentence → skip this one, but now re-arm
-    #             trigger = False
-    #             self.triggered = False
-    #         else:
-    #             # normal check
-    #             trigger = digit_count > min_digits
-    #             if trigger:
-    #                 self.triggered = True
-
-    #         # advance the window
-    #         new_start = cur_idx + 1
-    #         self.last_period_idx = new_start
-    #         return trigger, new_start
-
-    #     # not end of sentence → nothing changes
-    #     return False, self.last_period_idx
-
-    # def check_trigger_from_last_period(
-    #     self,
-    #     token_ids: List[int],
-    #     min_digits: int = 5
-    # ):
-    #     cur_idx = len(token_ids) - 1
-    #     tok = self.tokenizer.decode([token_ids[cur_idx]], skip_special_tokens=True)
-    #     if "." in tok or "!" in tok or "?" in tok or ":" in tok:
-    #         # 解码从上次句号后到当前句号的全部文本
-    #         slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-    #         text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
-
-
-    #         digit_count = sum(ch.isdigit() for ch in text_slice)
-
-    #         trigger = digit_count > min_digits
-
-    #         new_start = cur_idx + 1
-    #         return trigger, new_start
-    #     else:
-    #         return False, self.last_period_idx
-        
 
     def _sample(
         self,
@@ -265,6 +235,23 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
         """
+        model_kwargs = dict(model_kwargs)
+
+        # For cyclical wait injection
+        self.recent_sentences = []
+        self.last_injected_idx = 0
+        current_step = 0
+        amplitude = getattr(self, "wait_cyclical_amplitude", 3.0)
+        period = getattr(self, "wait_cyclical_period", 100.0)
+        shift = getattr(self, "wait_cyclical_shift", 0.0)
+        wait_token_ids = self.tokenizer.convert_tokens_to_ids(["wait", "Wait"])
+        last_injected_step = -1000  # arbitrary large gap
+        wait_injection_interval = 20  # only inject every N steps
+        # Dynamic wait interval: starts high, decreases with time
+        min_interval = 6
+        max_interval = 30
+        decay_speed = 200  # higher = slower decay
+
         # init values
         pad_token_id = generation_config._pad_token_tensor
         output_attentions = generation_config.output_attentions
@@ -314,9 +301,6 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             is_prefill = True
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-
-
-
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -384,100 +368,110 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
+            # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            current_step += 1  # <-- Add this line to ensure correct wait timing
+
+            #print("Step", current_step, "→ Generated token:", self.tokenizer.decode(next_tokens[0].item()))
 
 
-# ==========================================================
-            # # 3. 检查是否需要插入 “Wait…” 
-            # last_token_id = input_ids[0, -1].item()
-            # # check sentence end
-            # if self._is_end_of_sentence(last_token_id):
-            #     # decode and update context
-            #     text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            #     self.recent_text = text
+# ==== Aggressively Inject "Wait" for Self-Reflection ====
+            shifted_pos = (current_step + self.wait_cyclical_shift * self.wait_cyclical_period) % self.wait_cyclical_period
+            cycle_pos = shifted_pos / self.wait_cyclical_period
 
-            #     # grab last sentence and count digits
-            #     prev_sent = text.rstrip().rsplit('.', 1)[-1]
-            #     self.digit_count = sum(ch.isdigit() for ch in prev_sent)
-            
-            # if self.digit_count > 5:
-
-            #all_ids = input_ids[0].tolist()
-
-            # 判断是否触发插入
-            # do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-            #     token_ids=all_ids,
-            #     min_digits=5
-            # )
-            # only consider injection if the model just emitted TWO newlines
-            # newline_ids = self.tokenizer("\n\n", add_special_tokens=False).input_ids
-            # if len(all_ids) >= len(newline_ids) and all_ids[-len(newline_ids):] == newline_ids:
-            #     do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-            #         token_ids=all_ids,
-            #         min_digits=self.min_digits
-            #     )
-            
-            # else:
-            #     do_insert = False
-            full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
-            if full_text.endswith("\n\n"):
-                # we've just started a fresh paragraph → run digit trigger
-                all_ids = input_ids[0].tolist()
-                do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-                    token_ids=all_ids,
-                    min_digits=self.min_digits
-                )
+            # Cosine-shaped injection window
+            if cycle_pos <= 0.25:
+                penalty = (cycle_pos / 0.25) * self.wait_cyclical_amplitude
+            elif cycle_pos <= 0.75:
+                penalty = self.wait_cyclical_amplitude - ((cycle_pos - 0.25) / 0.5) * 2 * self.wait_cyclical_amplitude
             else:
-                do_insert = False
-                
-            if do_insert:
-                # 准备强制的文本及其 ID
-                #extra = "Wait"
-                # Make sure we haven’t already injected at this same spot
-                cur_idx = len(all_ids)
-                if cur_idx <= self.last_injected_idx:
-                    do_insert = False
-                else:
-                    self.last_injected_idx = cur_idx
-                # now inject “Wait” 
-                extra     = "Wait"
-                
-                extra_ids = self.tokenizer(extra, add_special_tokens=False).input_ids
-                extra_tensor = torch.tensor(extra_ids, device=input_ids.device).unsqueeze(0)
+                penalty = -self.wait_cyclical_amplitude + ((cycle_pos - 0.75) / 0.25) * self.wait_cyclical_amplitude
 
-                # 3a. 先更新 input_ids
-                input_ids = torch.cat([input_ids, extra_tensor], dim=1)
 
-                # 3b. 重新 prepare inputs，并做一次“真实”前向
-                forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                forced_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
-                forced_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
-                forced_out = model_forward(**forced_inputs, return_dict=True)
+            do_insert = True  # Always allow injection if should_inject is met
+            cur_idx = input_ids.shape[1]
+            recent_segment = self.tokenizer.decode(input_ids[0, self.last_injected_idx+1:].tolist())
 
-                # 3c. 提取 forced_out 对应 step 的中间量
-                forced_logits = forced_out.logits[:, -1, :].float()
-                forced_scores = logits_processor(input_ids, forced_logits)
-                forced_attn   = (forced_out.decoder_attentions 
-                                if self.config.is_encoder_decoder else forced_out.attentions)
-                forced_hs     = (forced_out.decoder_hidden_states 
-                                if self.config.is_encoder_decoder else forced_out.hidden_states)
-                forced_cross  = getattr(forced_out, "cross_attentions", None)
+            # Detect sentence boundaries or reflective cues
+            sentence_boundary_like = any(phrase in recent_segment.lower() for phrase in ["so", "thus", "therefore", "now", "next", "let's"])
+            is_eos = self._is_end_of_sentence(next_tokens[0].item()) or sentence_boundary_like
 
-                # 3d. 把这一 token 的数据 append 到记录里
-                if output_scores:     scores            += (forced_scores,)
-                if output_logits:     raw_logits        += (forced_logits,)
-                if output_attentions: 
-                    decoder_attentions += (forced_attn,)
-                    if forced_cross is not None:
-                        cross_attentions  += (forced_cross,)
-                if output_hidden_states:
-                    decoder_hidden_states += (forced_hs,)
-
-                # 3e. 更新缓存，保证后续生成连贯
-                model_kwargs = self._update_model_kwargs_for_generation(
-                    forced_out, model_kwargs,
-                    is_encoder_decoder=self.config.is_encoder_decoder
+            # Define when we should inject "Wait"
+            should_inject = (
+                6 <= len(recent_segment.split()) <= 30 and
+                not any(recent_segment.endswith(s) for s in self.recent_sentences) and
+                (
+                    sum(c.isdigit() for c in recent_segment) >= 2 or
+                    any(trigger in recent_segment.lower() for trigger in ["let", "so", "then", "next", "consider"])
                 )
+            )
+
+            # Optional debug logging
+            # if not should_inject:
+            #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
+
+            # Ramp up from 0 to 1 between step 0 → 80% of max tokens
+            generation_ratio = current_step / generation_config.max_new_tokens
+            # Start at 0.3, increase to 1.0
+            injection_prob = 0.3 + 0.7 * generation_ratio
+
+            # if generation_ratio < 0.2:
+            #     wait_injection_interval = 6  # low frequency at the beginning
+            # elif generation_ratio < 0.5:
+            #     wait_injection_interval = 3  # increase during reasoning
+            # else:
+            #     wait_injection_interval = 2  # high frequency near the end
+            
+            if generation_ratio < 0.1:
+                wait_injection_interval = 8
+            elif generation_ratio < 0.3:
+                wait_injection_interval = 5
+            elif generation_ratio < 0.6:
+                wait_injection_interval = 3
+            else:
+                wait_injection_interval = 2
+            
+            wait_injection_interval = int(max_interval - (max_interval - min_interval) * (1 - math.exp(-current_step / decay_speed)))
+            # if not should_inject:
+            #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
+            if should_inject and do_insert and (current_step - last_injected_step >= wait_injection_interval) or any(phrase in recent_segment.lower() for phrase in ["so", "thus", "therefore", "let", "now", "next"]):
+                if random.random() < injection_prob:
+                    last_injected_step = current_step
+                    self.last_injected_idx = input_ids.shape[1]
+
+                    self.recent_sentences.append(recent_segment)
+                    if len(self.recent_sentences) > 5:
+                        self.recent_sentences.pop(0)
+
+                    extra_ids = self.tokenizer("Wait", add_special_tokens=False).input_ids
+                    extra_tensor = torch.tensor(extra_ids, device=input_ids.device).unsqueeze(0)
+                    # print(f"[Inject] Step {current_step} → Injecting 'Wait' after: {repr(recent_segment[-40:])}")
+                    
+                    input_ids = torch.cat([input_ids, extra_tensor], dim=1)
+
+                    # Forward pass for new token
+                    forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                    if output_attentions: forced_inputs["output_attentions"] = True
+                    if output_hidden_states: forced_inputs["output_hidden_states"] = True
+                    forced_out = model_forward(**forced_inputs, return_dict=True)
+
+                    forced_logits = forced_out.logits[:, -1, :].float()
+                    forced_scores = logits_processor(input_ids, forced_logits)
+
+                    if output_scores: scores += (forced_scores,)
+                    if output_logits: raw_logits += (forced_logits,)
+                    if output_attentions:
+                        decoder_attentions += (forced_out.attentions if not self.config.is_encoder_decoder else forced_out.decoder_attentions,)
+                    if output_hidden_states:
+                        decoder_hidden_states += (forced_out.hidden_states if not self.config.is_encoder_decoder else forced_out.decoder_hidden_states,)
+
+                    model_kwargs = self._update_model_kwargs_for_generation(
+                        forced_out, model_kwargs,
+                        is_encoder_decoder=self.config.is_encoder_decoder
+                    )
+
+                    current_step += 1
+                    continue
 # ==========================================================
 
             if streamer is not None:

@@ -1,8 +1,9 @@
 import json
 import copy
+import os
+
 acc_len = [40]
 ref_factor = [2]
-
 
 original_config = """{
   "model": "Qwen/Qwen2.5-7B",
@@ -11,8 +12,8 @@ original_config = """{
     {
       "type": "KeywordDecayIntervene",
       "amp": 1.0,
-      "top_neurons_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300.txt",
-      "layer_list_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300_layer.txt",
+      "top_neurons_file": "./Activation_data/Qwen2.5_7b_Activations_index.txt",
+      "layer_list_file": "./Activation_data/Qwen2.5_7b_Activations_layer_index.txt",
       "keywords": [15, 16, 17, 18, 19, 20, 21, 22, 23, 24], 
       "t_max": 100, 
       "t_initial": 5, 
@@ -25,9 +26,15 @@ original_config = """{
     "temperature": 0.6,
     "top_p": 0.9,
     "_sentence_cooldown": 4,
-    "do_sample": true
+    "do_sample": true,
+    "wait_cyclical_amplitude": 3.0,
+    "wait_cyclical_period": 150.0,
+    "wait_cyclical_shift": 0.0
   }
 }"""
+
+# Ensure output directory exists
+os.makedirs("configs", exist_ok=True)
 
 json_config = json.loads(original_config)
 
@@ -36,4 +43,9 @@ for num_acc in acc_len:
         json_config_copy = copy.deepcopy(json_config)
         json_config_copy["intervene_functions"][0]["amp"] = ref_fac
         json_config_copy["intervene_functions"][0]["n_neurons"] = num_acc
-        json.dump(json_config_copy, open(f"EELo-CoT/gpqa/reasoing_probing_vllm-main_rule_zzk/configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json", "w"))
+
+        config_filename = f"configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json"
+        with open(config_filename, "w") as f:
+            json.dump(json_config_copy, f, indent=2)
+
+        print(f"Saved config to {config_filename}")

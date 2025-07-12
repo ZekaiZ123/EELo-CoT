@@ -33,7 +33,7 @@ from intervene_functions import (
 )
 
 
-def generate_answer(model, tokenizer, prompt, max_new_tokens=2048, temperature=0.6, top_p=0.9):
+def generate_answer(model, tokenizer, prompt, max_new_tokens=4096, temperature=0.6, top_p=0.9):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         output_tokens = model.generate(
@@ -43,7 +43,9 @@ def generate_answer(model, tokenizer, prompt, max_new_tokens=2048, temperature=0
             top_p=top_p,
             do_sample=True
         )
-    return tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    output_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    return output_text
+
 
 def build_zero_shot_prompt(question):
     return (
@@ -149,7 +151,7 @@ def process_chunk(gpu_id, data_chunk, config_path, data_name="math"):
 
 
     # Initialize model on this GPU
-    model_id = config.get("model", "Qwen/Qwen2.5-Math-7B")
+    model_id = config.get("model")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
     # Initialize intervention functions from config
@@ -157,7 +159,7 @@ def process_chunk(gpu_id, data_chunk, config_path, data_name="math"):
     
     
     # First load the model without intervention functions
-    deepseek_qwen = DeepSeekQwenModel.from_pretrained(model_id, intervene_functions=intervene_functions, layer_idx=config.get("layer_idx", 27))
+    deepseek_qwen = DeepSeekQwenModel.from_pretrained(model_id, intervene_functions=intervene_functions, layer_idx=config.get("layer_idx"))
 
     
     deepseek_qwen.to(device)
@@ -176,8 +178,15 @@ def process_chunk(gpu_id, data_chunk, config_path, data_name="math"):
             "_sentence_cooldown": 4
         }
 
+    # Load generation parameters from config
+    generation_params = config.get("generation_params", {})
     deepseek_qwen._sentence_cooldown = generation_params.get("_sentence_cooldown", 4)
-    
+
+    # Pass cyclical wait params if present
+    deepseek_qwen.wait_cyclical_amplitude = generation_params.get("wait_cyclical_amplitude", 3.0)
+    deepseek_qwen.wait_cyclical_period = generation_params.get("wait_cyclical_period", 100.0)
+    deepseek_qwen.wait_cyclical_shift = generation_params.get("wait_cyclical_shift", 0.0)
+
     
     results = []
     verifier_params = []
@@ -302,7 +311,7 @@ def evaluate_model_on_math500_parallel(test_data, config_path, num_gpus=4,
     return accuracy, avg_word_count, self_reflection_ratio
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,5,6"
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run inference with model intervention")
     parser.add_argument("--config", type=str, required=True, 
@@ -317,9 +326,10 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     
     # Load the MATH-500 dataset (test split)
-    math500_dataset = load_dataset("hendrydong/gpqa_diamond_mc")
-    test_data = math500_dataset["test"]
-    # test_data = test_data[:100]
+    gpqa_dataset = load_dataset("hendrydong/gpqa_diamond_mc")
+    test_data = gpqa_dataset["test"]
+    #test_data = gpqa_dataset["test"].select(range(3))  # only first 3 samples
+
     
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)

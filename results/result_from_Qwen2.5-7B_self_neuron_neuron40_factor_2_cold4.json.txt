@@ -1,0 +1,1 @@
+Accuracy: 28.28%, Avg Word Count: 1425.08, Self Reflection Ratio: 100.00%
