@@ -241,6 +241,9 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
         self.recent_sentences = []
         self.last_injected_idx = 0
         current_step = 0
+        wait_insertions = 0
+        max_wait_tokens = 5  # Cap to avoid overwhelming output
+
         amplitude = getattr(self, "wait_cyclical_amplitude", 3.0)
         period = getattr(self, "wait_cyclical_period", 100.0)
         shift = getattr(self, "wait_cyclical_shift", 0.0)
@@ -397,12 +400,13 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             is_eos = self._is_end_of_sentence(next_tokens[0].item()) or sentence_boundary_like
 
             # Define when we should inject "Wait"
+            clean_segment = recent_segment.strip().lower()
             should_inject = (
-                6 <= len(recent_segment.split()) <= 30 and
-                not any(recent_segment.endswith(s) for s in self.recent_sentences) and
+                4 <= len(clean_segment.split()) <= 60 and
+                clean_segment not in self.recent_sentences and
                 (
-                    sum(c.isdigit() for c in recent_segment) >= 2 or
-                    any(trigger in recent_segment.lower() for trigger in ["let", "so", "then", "next", "consider"])
+                    sum(c.isdigit() for c in clean_segment) >= 1 or
+                    any(trigger in clean_segment for trigger in ["let", "so", "then", "next", "consider", "step", "suppose"])
                 )
             )
 
@@ -410,10 +414,29 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             # if not should_inject:
             #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
 
-            # Ramp up from 0 to 1 between step 0 → 80% of max tokens
             generation_ratio = current_step / generation_config.max_new_tokens
-            # Start at 0.3, increase to 1.0
-            injection_prob = 0.3 + 0.7 * generation_ratio
+
+            def injection_prob_curve(r: float) -> float:
+                if r < 0.2:
+                    return 0.1
+                elif r < 0.4:
+                    return 0.3 + 1.0 * (r - 0.2) / 0.2  # ramps up to 1.3
+                elif r < 0.7:
+                    return 1.3  # peak zone
+                elif r < 0.9:
+                    return 1.3 - 0.8 * (r - 0.7) / 0.2  # tapers to 0.5
+                else:
+                    return 0.3  # low again
+
+            injection_prob = min(1.0, max(0.0, injection_prob_curve(generation_ratio)))
+            
+            # Adaptive interval: low at the start, tighter in mid/end
+            if generation_ratio < 0.2:
+                wait_injection_interval = 10
+            elif generation_ratio < 0.5:
+                wait_injection_interval = 6
+            else:
+                wait_injection_interval = 3
 
             # if generation_ratio < 0.2:
             #     wait_injection_interval = 6  # low frequency at the beginning
@@ -434,7 +457,13 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             wait_injection_interval = int(max_interval - (max_interval - min_interval) * (1 - math.exp(-current_step / decay_speed)))
             # if not should_inject:
             #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
-            if should_inject and do_insert and (current_step - last_injected_step >= wait_injection_interval) or any(phrase in recent_segment.lower() for phrase in ["so", "thus", "therefore", "let", "now", "next"]):
+            if (
+                not self.stop_injecting and
+                wait_insertions < max_wait_tokens and
+                should_inject and
+                do_insert and
+                (current_step - last_injected_step >= wait_injection_interval)
+            ):
                 if random.random() < injection_prob:
                     last_injected_step = current_step
                     self.last_injected_idx = input_ids.shape[1]
@@ -448,7 +477,13 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
                     # print(f"[Inject] Step {current_step} → Injecting 'Wait' after: {repr(recent_segment[-40:])}")
                     
                     input_ids = torch.cat([input_ids, extra_tensor], dim=1)
-
+                    wait_insertions += 1
+                    clean_segment = recent_segment.strip().lower()
+                    if clean_segment not in self.recent_sentences:
+                        self.recent_sentences.append(clean_segment)
+                        if len(self.recent_sentences) > 5:
+                            self.recent_sentences.pop(0)
+                            
                     # Forward pass for new token
                     forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
                     if output_attentions: forced_inputs["output_attentions"] = True

@@ -311,7 +311,7 @@ def evaluate_model_on_math500_parallel(test_data, config_path, num_gpus=4,
     return accuracy, avg_word_count, self_reflection_ratio
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,5,6"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run inference with model intervention")
     parser.add_argument("--config", type=str, required=True, 
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     # Load the MATH-500 dataset (test split)
     gpqa_dataset = load_dataset("hendrydong/gpqa_diamond_mc")
     test_data = gpqa_dataset["test"]
-    #test_data = gpqa_dataset["test"].select(range(3))  # only first 3 samples
+    test_data = gpqa_dataset["test"].select(range(3))  # only first 3 samples
 
     
     # Create output directory if it doesn't exist
