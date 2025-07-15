@@ -1,6 +1,8 @@
 import torch
 import math
 from transformers import PreTrainedTokenizer
+import torch.nn as nn
+
     
 class ConstantInterveneFunction:
     def __init__(
@@ -159,5 +161,29 @@ class KeywordDecayInterveneFunction:
         self.t += 1
         return self.handles
     
+
+class DeltaPatchInterveneFunction:
+    def __init__(self, delta_dict: dict[int, torch.Tensor]):
+        self.delta_dict = delta_dict
+        self.handles = []
+
+    def attach(self, modules: list[nn.Module]):
+        self.remove()
+        for layer_id, delta in self.delta_dict.items():
+            def _hook(mod, inp, out, delta=delta):
+                return out + delta.to(out.device)
+            handle = modules[layer_id].register_forward_hook(_hook)
+            self.handles.append(handle)
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+    def __call__(self, last_token_id: int):
+        # No dynamic update needed during generation; hook is persistent
+        return
+
+
     
             

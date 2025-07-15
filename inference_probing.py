@@ -32,6 +32,15 @@ from intervene_functions import (
     KeywordDecayInterveneFunction
 )
 
+from intervene_functions import (
+    ConstantInterveneFunction,
+    KeywordInterveneFunction,
+    ConstantDecayInterveneFunction,
+    KeywordDecayInterveneFunction,
+    DeltaPatchInterveneFunction  
+)
+
+
 
 def generate_answer(model, tokenizer, prompt, max_new_tokens=2048, temperature=0.6, top_p=0.9):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -131,6 +140,14 @@ def initialize_intervene_functions(config, tokenizer=None, modules=None):
                 modules        = modules,
                 tokenizer=tokenizer
             )
+        elif func_type == "DeltaPatchIntervene":
+            delta_dict = {}
+            for l in func_config["target_layers"]:
+                delta_path = func_config["delta_files"][str(l)]
+                delta_dict[l] = torch.load(delta_path).squeeze(0).squeeze(0)  # shape [hidden]
+            intervene_function = DeltaPatchInterveneFunction(delta_dict)
+            if modules is not None:
+                intervene_function.attach(modules)
         else:
             raise ValueError(f"Unknown intervention function type: {func_type}")
         
@@ -302,7 +319,7 @@ def evaluate_model_on_math500_parallel(test_data, config_path, num_gpus=4,
     return accuracy, avg_word_count, self_reflection_ratio
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run inference with model intervention")
     parser.add_argument("--config", type=str, required=True, 
@@ -317,8 +334,8 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     
     # Load the MATH-500 dataset (test split)
-    math500_dataset = load_dataset("hendrydong/gpqa_diamond_mc")
-    test_data = math500_dataset["test"]
+    gpqa_dataset = load_dataset("hendrydong/gpqa_diamond_mc")
+    test_data = gpqa_dataset["test"]
     # test_data = test_data[:100]
     
     # Create output directory if it doesn't exist

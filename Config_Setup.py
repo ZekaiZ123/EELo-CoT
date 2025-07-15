@@ -6,18 +6,18 @@ ref_factor = [2]
 
 original_config = """{
   "model": "Qwen/Qwen2.5-7B",
-  "layer_idx": 27,
   "intervene_functions": [
     {
-      "type": "KeywordDecayIntervene",
-      "amp": 1.0,
-      "top_neurons_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300.txt",
-      "layer_list_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300_layer.txt",
-      "keywords": [15, 16, 17, 18, 19, 20, 21, 22, 23, 24], 
-      "t_max": 100, 
-      "t_initial": 5, 
-      "n_neurons": 100, 
-      "cool_down": 10 
+      "type": "DeltaPatchIntervene",
+      "target_layers": [22, 23, 24, 25, 26, 27],
+      "delta_files": {
+        "22": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer22.pt",
+        "23": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer23.pt",
+        "24": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer24.pt",
+        "25": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer25.pt",
+        "26": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer26.pt",
+        "27": "/data/zekai/EELo-CoT_full_activations_extraction/activation_deltas/delta_layer27.pt"
+      }
     }
   ],
   "generation_params": {
@@ -36,4 +36,4 @@ for num_acc in acc_len:
         json_config_copy = copy.deepcopy(json_config)
         json_config_copy["intervene_functions"][0]["amp"] = ref_fac
         json_config_copy["intervene_functions"][0]["n_neurons"] = num_acc
-        json.dump(json_config_copy, open(f"EELo-CoT/gpqa/reasoing_probing_vllm-main_rule_zzk/configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json", "w"))
+        json.dump(json_config_copy, open(f"/home/zekai/EELo-CoT/configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json", "w"))
