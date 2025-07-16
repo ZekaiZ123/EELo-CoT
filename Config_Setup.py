@@ -11,8 +11,8 @@ original_config = """{
     {
       "type": "KeywordDecayIntervene",
       "amp": 1.0,
-      "top_neurons_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300.txt",
-      "layer_list_file": "EELo-CoT/Activation_data/Qwen2.5_7b_base_all_neurons_300_layer.txt",
+      "top_neurons_file": "/home/zekai/EELo-CoT/Activation_data/Qwen2.5_7b_Activations_index.txt",
+      "layer_list_file": "/home/zekai/EELo-CoT/Activation_data/Qwen2.5_7b_Activations_layer_index.txt",
       "keywords": [15, 16, 17, 18, 19, 20, 21, 22, 23, 24], 
       "t_max": 100, 
       "t_initial": 5, 
@@ -36,4 +36,4 @@ for num_acc in acc_len:
         json_config_copy = copy.deepcopy(json_config)
         json_config_copy["intervene_functions"][0]["amp"] = ref_fac
         json_config_copy["intervene_functions"][0]["n_neurons"] = num_acc
-        json.dump(json_config_copy, open(f"EELo-CoT/gpqa/reasoing_probing_vllm-main_rule_zzk/configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json", "w"))
+        json.dump(json_config_copy, open(f"/home/zekai/EELo-CoT/configs/Qwen2.5-7B_self_neuron_neuron{num_acc}_factor_{ref_fac}_cold4.json", "w"))

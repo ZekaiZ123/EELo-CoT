@@ -302,7 +302,7 @@ def evaluate_model_on_math500_parallel(test_data, config_path, num_gpus=4,
     return accuracy, avg_word_count, self_reflection_ratio
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "6"
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run inference with model intervention")
     parser.add_argument("--config", type=str, required=True, 

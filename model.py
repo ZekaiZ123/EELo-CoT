@@ -36,6 +36,31 @@ from transformers.generation.utils import (
 from transformers.generation.streamers import BaseStreamer
 import os
 
+class WaitTokenScheduler:
+    def __init__(self, alpha_new=0.05, alpha_repeat=0.005, threshold=0.8):
+        self.alpha_new = alpha_new
+        self.alpha_repeat = alpha_repeat
+        self.threshold = threshold
+        self.wait_prob = 0.0
+        self.token_history = set()
+        self.last_injected_idx = -1
+
+    def update(self, token_id: int, tokenizer) -> float:
+        token_str = tokenizer.decode([token_id], skip_special_tokens=False).strip()
+        if not token_str:
+            return self.wait_prob
+
+        is_new = token_str not in self.token_history
+        self.wait_prob += self.alpha_new if is_new else self.alpha_repeat
+        self.token_history.add(token_str)
+        return self.wait_prob
+
+    def should_inject(self, input_ids, tokenizer) -> bool:
+        return self.wait_prob > self.threshold
+
+    def reset(self):
+        self.wait_prob = 0.0
+
 class DeepSeekQwenModel(Qwen2ForCausalLM):
     def __init__(
         self,
@@ -51,6 +76,7 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
         self.armed = True                  # ready to fire
         self.sentences_since_trigger = 0   # how many sentences have passed since last fire
         self._sentence_cooldown = 4        # require 4 sentences in cooldown
+        self.scheduler = WaitTokenScheduler(alpha_new=0.05, alpha_repeat=0.005, threshold=0.8)
 
         # Hook & schedule state
         if "intervene_functions" in kwargs:
@@ -165,63 +191,7 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
 
         # not a sentence boundary → nothing changes
         return False, self.last_period_idx
-
     
-    # def check_trigger_from_last_period(
-    #     self,
-    #     token_ids: List[int],
-    #     min_digits: int = 5
-    # ):
-    #     cur_idx = len(token_ids) - 1
-    #     tok = self.tokenizer.decode([token_ids[cur_idx]], skip_special_tokens=True)
-
-    #     # did we just hit end-of-sentence?
-    #     if "." in tok or "!" in tok or "?" in tok or ":" in tok:
-    #         # grab everything since last period (inclusive) up to here
-    #         slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-    #         text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
-    #         digit_count = sum(ch.isdigit() for ch in text_slice)
-
-    #         if self.triggered:
-    #             # we triggered on the previous sentence → skip this one, but now re-arm
-    #             trigger = False
-    #             self.triggered = False
-    #         else:
-    #             # normal check
-    #             trigger = digit_count > min_digits
-    #             if trigger:
-    #                 self.triggered = True
-
-    #         # advance the window
-    #         new_start = cur_idx + 1
-    #         self.last_period_idx = new_start
-    #         return trigger, new_start
-
-    #     # not end of sentence → nothing changes
-    #     return False, self.last_period_idx
-
-    # def check_trigger_from_last_period(
-    #     self,
-    #     token_ids: List[int],
-    #     min_digits: int = 5
-    # ):
-    #     cur_idx = len(token_ids) - 1
-    #     tok = self.tokenizer.decode([token_ids[cur_idx]], skip_special_tokens=True)
-    #     if "." in tok or "!" in tok or "?" in tok or ":" in tok:
-    #         # 解码从上次句号后到当前句号的全部文本
-    #         slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-    #         text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
-
-
-    #         digit_count = sum(ch.isdigit() for ch in text_slice)
-
-    #         trigger = digit_count > min_digits
-
-    #         new_start = cur_idx + 1
-    #         return trigger, new_start
-    #     else:
-    #         return False, self.last_period_idx
-        
 
     def _sample(
         self,
@@ -293,7 +263,8 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
         batch_size, cur_len = input_ids.shape
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs, model_input_name="input_ids")
+
 
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
@@ -387,98 +358,48 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
 
 
-# ==========================================================
-            # # 3. 检查是否需要插入 “Wait…” 
-            # last_token_id = input_ids[0, -1].item()
-            # # check sentence end
-            # if self._is_end_of_sentence(last_token_id):
-            #     # decode and update context
-            #     text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            #     self.recent_text = text
+            # Update scheduler with current token
+            token_id = next_tokens[0].item()
+            _ = self.scheduler.update(token_id, self.tokenizer)
 
-            #     # grab last sentence and count digits
-            #     prev_sent = text.rstrip().rsplit('.', 1)[-1]
-            #     self.digit_count = sum(ch.isdigit() for ch in prev_sent)
-            
-            # if self.digit_count > 5:
+            # Check sentence boundary using _is_end_of_sentence
+            if self._is_end_of_sentence(token_id):
+                if self.scheduler.should_inject(input_ids, self.tokenizer):
+                    cur_idx = len(input_ids[0])
+                    if cur_idx > self.scheduler.last_injected_idx:
+                        self.scheduler.last_injected_idx = cur_idx
 
-            #all_ids = input_ids[0].tolist()
+                        # Inject "Wait"
+                        extra_ids = self.tokenizer("Wait", add_special_tokens=False).input_ids
+                        extra_tensor = torch.tensor(extra_ids, device=input_ids.device).unsqueeze(0)
+                        input_ids = torch.cat([input_ids, extra_tensor], dim=1)
 
-            # 判断是否触发插入
-            # do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-            #     token_ids=all_ids,
-            #     min_digits=5
-            # )
-            # only consider injection if the model just emitted TWO newlines
-            # newline_ids = self.tokenizer("\n\n", add_special_tokens=False).input_ids
-            # if len(all_ids) >= len(newline_ids) and all_ids[-len(newline_ids):] == newline_ids:
-            #     do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-            #         token_ids=all_ids,
-            #         min_digits=self.min_digits
-            #     )
-            
-            # else:
-            #     do_insert = False
-            full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
-            if full_text.endswith("\n\n"):
-                # we've just started a fresh paragraph → run digit trigger
-                all_ids = input_ids[0].tolist()
-                do_insert, self.last_period_idx = self.check_trigger_from_last_period(
-                    token_ids=all_ids,
-                    min_digits=self.min_digits
-                )
-            else:
-                do_insert = False
-                
-            if do_insert:
-                # 准备强制的文本及其 ID
-                #extra = "Wait"
-                # Make sure we haven’t already injected at this same spot
-                cur_idx = len(all_ids)
-                if cur_idx <= self.last_injected_idx:
-                    do_insert = False
-                else:
-                    self.last_injected_idx = cur_idx
-                # now inject “Wait” 
-                extra     = "Wait"
-                
-                extra_ids = self.tokenizer(extra, add_special_tokens=False).input_ids
-                extra_tensor = torch.tensor(extra_ids, device=input_ids.device).unsqueeze(0)
+                        # Force forward pass to update caches
+                        forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                        forced_out = model_forward(**forced_inputs, return_dict=True)
 
-                # 3a. 先更新 input_ids
-                input_ids = torch.cat([input_ids, extra_tensor], dim=1)
+                        # Extract forced outputs for bookkeeping
+                        forced_logits = forced_out.logits[:, -1, :].float()
+                        forced_scores = logits_processor(input_ids, forced_logits)
 
-                # 3b. 重新 prepare inputs，并做一次“真实”前向
-                forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                forced_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
-                forced_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
-                forced_out = model_forward(**forced_inputs, return_dict=True)
+                        if output_scores: scores += (forced_scores,)
+                        if output_logits: raw_logits += (forced_logits,)
+                        if output_attentions:
+                            decoder_attentions += (forced_out.decoder_attentions
+                                                if self.config.is_encoder_decoder
+                                                else forced_out.attentions,)
+                        if output_hidden_states:
+                            decoder_hidden_states += (forced_out.decoder_hidden_states
+                                                    if self.config.is_encoder_decoder
+                                                    else forced_out.hidden_states,)
 
-                # 3c. 提取 forced_out 对应 step 的中间量
-                forced_logits = forced_out.logits[:, -1, :].float()
-                forced_scores = logits_processor(input_ids, forced_logits)
-                forced_attn   = (forced_out.decoder_attentions 
-                                if self.config.is_encoder_decoder else forced_out.attentions)
-                forced_hs     = (forced_out.decoder_hidden_states 
-                                if self.config.is_encoder_decoder else forced_out.hidden_states)
-                forced_cross  = getattr(forced_out, "cross_attentions", None)
+                        model_kwargs = self._update_model_kwargs_for_generation(
+                            forced_out, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+                        )
 
-                # 3d. 把这一 token 的数据 append 到记录里
-                if output_scores:     scores            += (forced_scores,)
-                if output_logits:     raw_logits        += (forced_logits,)
-                if output_attentions: 
-                    decoder_attentions += (forced_attn,)
-                    if forced_cross is not None:
-                        cross_attentions  += (forced_cross,)
-                if output_hidden_states:
-                    decoder_hidden_states += (forced_hs,)
+                        # Reset after successful injection
+                        self.scheduler.reset()
 
-                # 3e. 更新缓存，保证后续生成连贯
-                model_kwargs = self._update_model_kwargs_for_generation(
-                    forced_out, model_kwargs,
-                    is_encoder_decoder=self.config.is_encoder_decoder
-                )
-# ==========================================================
 
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
