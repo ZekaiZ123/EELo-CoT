@@ -2,3 +2,14 @@ Accuracy: 28.28%, Avg Word Count: 1425.08, Self Reflection Ratio: 100.00%
 Accuracy: 66.67%, Avg Word Count: 359.67, Self Reflection Ratio: 0.00%
 Accuracy: 33.33%, Avg Word Count: 390.67, Self Reflection Ratio: 0.00%
 Accuracy: 0.00%, Avg Word Count: 411.67, Self Reflection Ratio: 0.00%
+Accuracy: 33.33%, Avg Word Count: 398.33, Self Reflection Ratio: 0.00%
+Accuracy: 0.00%, Avg Word Count: 613.33, Self Reflection Ratio: 66.67%
+Accuracy: 66.67%, Avg Word Count: 887.33, Self Reflection Ratio: 66.67%
+Accuracy: 0.00%, Avg Word Count: 370.00, Self Reflection Ratio: 0.00%
+Accuracy: 0.00%, Avg Word Count: 369.33, Self Reflection Ratio: 66.67%
+Accuracy: 0.00%, Avg Word Count: 393.00, Self Reflection Ratio: 33.33%
+Accuracy: 0.00%, Avg Word Count: 351.33, Self Reflection Ratio: 0.00%
+Accuracy: 33.33%, Avg Word Count: 369.00, Self Reflection Ratio: 66.67%
+Accuracy: 0.00%, Avg Word Count: 386.00, Self Reflection Ratio: 0.00%
+Accuracy: 33.33%, Avg Word Count: 1050.67, Self Reflection Ratio: 66.67%
+Accuracy: 31.31%, Avg Word Count: 478.05, Self Reflection Ratio: 8.08%

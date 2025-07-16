@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 from typing import Optional, Union, List
 import random
-import math
 
 from transformers.cache_utils import (
     Cache,
@@ -53,15 +52,6 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
         self.armed = True                  # ready to fire
         self.sentences_since_trigger = 0   # how many sentences have passed since last fire
         self._sentence_cooldown = 4        # require 4 sentences in cooldown
-        self.wait_cyclical_amplitude = kwargs.pop("wait_cyclical_amplitude", 3.0)
-        self.wait_cyclical_period = kwargs.pop("wait_cyclical_period", 100.0)
-        self.wait_cyclical_shift = kwargs.pop("wait_cyclical_shift", 0.0)
-        self.reflection_cooldown = 4
-        self.sentences_since_reflection = self.reflection_cooldown
-        self.recent_sentences = []
-        self.stop_injecting = False  # Flag to stop wait injection after answer
-
-
 
         # Hook & schedule state
         if "intervene_functions" in kwargs:
@@ -74,47 +64,34 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
                 modules = [self.model.layers[i].mlp.act_fn for i in range(28)]
                 intervene_function.modules = modules
     
-    
-    def _get_initial_cache_position(self, input_ids, model_kwargs):
-        if hasattr(self, "_use_cache") and self._use_cache is False:
-            return model_kwargs
-        if "use_cache" not in model_kwargs:
-            model_kwargs["use_cache"] = True
-        if "cache_position" not in model_kwargs:
-            model_kwargs["cache_position"] = torch.arange(
-                input_ids.shape[1], dtype=torch.long, device=input_ids.device
-            )
+    def _get_initial_cache_position(self, input_ids, device, model_kwargs):
+        # Ensure seq_length is an integer, not a tensor
+        if isinstance(input_ids, torch.Tensor):
+            seq_length = input_ids.shape[1]
+        else:
+            raise ValueError("Expected input_ids to be a torch.Tensor")
+
+        cache_position = torch.ones((seq_length,), dtype=torch.int64, device=device).cumsum(0) - 1
+        model_kwargs["cache_position"] = cache_position
         return model_kwargs
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Override from_pretrained to handle intervention functions and cyclical scheduling properly"""
-
-        # Extract intervene + scheduling params first
+        """Override from_pretrained to handle intervention functions properly"""
+        
+        # Extract custom fields before passing to parent class
         intervene_functions = kwargs.pop("intervene_functions", None)
         layer_idx = kwargs.pop("layer_idx", 27)
 
-        # Extract cyclical parameters safely
-        cyclical_params = {
-            "wait_cyclical_amplitude": kwargs.pop("wait_cyclical_amplitude", 3.0),
-            "wait_cyclical_period": kwargs.pop("wait_cyclical_period", 100.0),
-            "wait_cyclical_shift": kwargs.pop("wait_cyclical_shift", 0.0),
-        }
-
-        # Load model weights using base class
+        # Call the parent class
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
-        # Assign intervention hooks
+        # Restore hooks
         if intervene_functions is not None:
             model.intervene_functions = intervene_functions
             modules = [model.model.layers[i].mlp.act_fn for i in range(28)]
             for intervene_function in intervene_functions:
                 intervene_function.modules = modules
-
-        # Assign cyclical schedule parameters
-        model.wait_cyclical_amplitude = cyclical_params["wait_cyclical_amplitude"]
-        model.wait_cyclical_period = cyclical_params["wait_cyclical_period"]
-        model.wait_cyclical_shift = cyclical_params["wait_cyclical_shift"]
 
         return model
 
@@ -169,40 +146,57 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
 
         # detect end-of-sentence punctuation
         if any(p in tok for p in [".", "!", "?", ":"]):
+            # slice out the just-completed sentence
             slice_ids = token_ids[self.last_period_idx : cur_idx + 1]
-            text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True).strip()
+            text_slice = self.tokenizer.decode(slice_ids, skip_special_tokens=True)
             digit_count = sum(ch.isdigit() for ch in text_slice)
 
-            # Avoid injecting on repetitive sentences
-            if text_slice in self.recent_sentences:
-                trigger = False
-            elif self.sentences_since_reflection < self.reflection_cooldown:
-                trigger = False
-            elif digit_count >= min_digits and len(text_slice.split()) > 6:
-                trigger = True
-                self.sentences_since_reflection = 0
-                self.recent_sentences.append(text_slice)
-                self.recent_sentences = self.recent_sentences[-3:]
-            else:
+            if not self.armed:
+                # still cooling down: count this sentence, do NOT fire
+                self.sentences_since_trigger += 1
+                if self.sentences_since_trigger >= self._sentence_cooldown:
+                    # cooldown complete → re-arm
+                    self.armed = True
                 trigger = False
 
-            self.sentences_since_reflection += 1
-            self.last_period_idx = cur_idx + 1
-            return trigger, self.last_period_idx
+            else:
+                # armed → check digit criterion
+                if digit_count > min_digits:
+                    trigger = True
+                    # immediately disarm and reset cooldown counter
+                    self.armed = False
+                    self.sentences_since_trigger = 0
+                else:
+                    trigger = False
+                    # remain armed for next sentence if you prefer
+
+            # advance window start so next slice is correct
+            new_start = cur_idx + 1
+            self.last_period_idx = new_start
+            return trigger, new_start
 
         # not a sentence boundary → nothing changes
         return False, self.last_period_idx
+
+    
+    
+        
 
     def _sample(
         self,
         input_ids: torch.LongTensor,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
-        generation_config: GenerationConfig,
-        synced_gpus: bool,
-        streamer: Optional["BaseStreamer"],
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[Union[int, List[int]]] = None,
+        output_scores: bool = False,
+        return_dict_in_generate: bool = False,
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+
         r"""
         Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
         can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
@@ -235,25 +229,11 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
         """
-        model_kwargs = dict(model_kwargs)
+        # Recover generation_config from model_kwargs
+        generation_config = model_kwargs.get("generation_config", self.generation_config)
 
-        # For cyclical wait injection
-        self.recent_sentences = []
-        self.last_injected_idx = 0
+        max_new_tokens = generation_config.max_new_tokens
         current_step = 0
-        wait_insertions = 0
-        max_wait_tokens = 5  # Cap to avoid overwhelming output
-
-        amplitude = getattr(self, "wait_cyclical_amplitude", 3.0)
-        period = getattr(self, "wait_cyclical_period", 100.0)
-        shift = getattr(self, "wait_cyclical_shift", 0.0)
-        wait_token_ids = self.tokenizer.convert_tokens_to_ids(["wait", "Wait"])
-        last_injected_step = -1000  # arbitrary large gap
-        wait_injection_interval = 20  # only inject every N steps
-        # Dynamic wait interval: starts high, decreases with time
-        min_interval = 6
-        max_interval = 30
-        decay_speed = 200  # higher = slower decay
 
         # init values
         pad_token_id = generation_config._pad_token_tensor
@@ -280,10 +260,18 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             )
 
         # keep track of which sequences are already finished
-        batch_size, cur_len = input_ids.shape
+        batch_size = int(input_ids.shape[0])
+        cur_len = int(input_ids.shape[1])
         this_peer_finished = False
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        unfinished_sequences = torch.ones((batch_size,), dtype=torch.long, device=input_ids.device)
+
+        # Now safe to call _get_initial_cache_position
+        model_kwargs = self._get_initial_cache_position(input_ids, input_ids.device, model_kwargs)
+
+        # Remove dangerous leftover fields
+        for k in ["generation_config", "logits_to_keep"]:
+            model_kwargs.pop(k, None)
 
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
@@ -302,8 +290,22 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             is_prefill = False
         else:
             is_prefill = True
+        
+        def scheduled_injection_prob(r: float) -> float:
+            """Returns injection probability based on generation progress (r ∈ [0,1])"""
+            if r < 0.2:
+                return 0.05
+            elif r < 0.4:
+                return 0.1 + (r - 0.2) / 0.2 * 0.3  # up to 0.4
+            elif r < 0.7:
+                return 0.4 + (r - 0.4) / 0.3 * 0.4  # up to 0.8
+            elif r < 0.9:
+                return 0.8 - (r - 0.7) / 0.2 * 0.5  # down to 0.3
+            else:
+                return 0.2
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -371,144 +373,149 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
-            # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            current_step += 1  # <-- Add this line to ensure correct wait timing
-
-            #print("Step", current_step, "→ Generated token:", self.tokenizer.decode(next_tokens[0].item()))
 
 
-# ==== Aggressively Inject "Wait" for Self-Reflection ====
-            shifted_pos = (current_step + self.wait_cyclical_shift * self.wait_cyclical_period) % self.wait_cyclical_period
-            cycle_pos = shifted_pos / self.wait_cyclical_period
+# ==========================================================
+            # # 3. 检查是否需要插入 “Wait…” 
+            # last_token_id = input_ids[0, -1].item()
+            # # check sentence end
+            # if self._is_end_of_sentence(last_token_id):
+            #     # decode and update context
+            #     text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            #     self.recent_text = text
 
-            # Cosine-shaped injection window
-            if cycle_pos <= 0.25:
-                penalty = (cycle_pos / 0.25) * self.wait_cyclical_amplitude
-            elif cycle_pos <= 0.75:
-                penalty = self.wait_cyclical_amplitude - ((cycle_pos - 0.25) / 0.5) * 2 * self.wait_cyclical_amplitude
-            else:
-                penalty = -self.wait_cyclical_amplitude + ((cycle_pos - 0.75) / 0.25) * self.wait_cyclical_amplitude
+            #     # grab last sentence and count digits
+            #     prev_sent = text.rstrip().rsplit('.', 1)[-1]
+            #     self.digit_count = sum(ch.isdigit() for ch in prev_sent)
+            
+            # if self.digit_count > 5:
 
+            #all_ids = input_ids[0].tolist()
 
-            do_insert = True  # Always allow injection if should_inject is met
-            cur_idx = input_ids.shape[1]
-            recent_segment = self.tokenizer.decode(input_ids[0, self.last_injected_idx+1:].tolist())
-
-            # Detect sentence boundaries or reflective cues
-            sentence_boundary_like = any(phrase in recent_segment.lower() for phrase in ["so", "thus", "therefore", "now", "next", "let's"])
-            is_eos = self._is_end_of_sentence(next_tokens[0].item()) or sentence_boundary_like
-
-            # Define when we should inject "Wait"
-            clean_segment = recent_segment.strip().lower()
-            should_inject = (
-                4 <= len(clean_segment.split()) <= 60 and
-                clean_segment not in self.recent_sentences and
-                (
-                    sum(c.isdigit() for c in clean_segment) >= 1 or
-                    any(trigger in clean_segment for trigger in ["let", "so", "then", "next", "consider", "step", "suppose"])
+            # 判断是否触发插入
+            # do_insert, self.last_period_idx = self.check_trigger_from_last_period(
+            #     token_ids=all_ids,
+            #     min_digits=5
+            # )
+            # only consider injection if the model just emitted TWO newlines
+            # newline_ids = self.tokenizer("\n\n", add_special_tokens=False).input_ids
+            # if len(all_ids) >= len(newline_ids) and all_ids[-len(newline_ids):] == newline_ids:
+            #     do_insert, self.last_period_idx = self.check_trigger_from_last_period(
+            #         token_ids=all_ids,
+            #         min_digits=self.min_digits
+            #     )
+            
+            # else:
+            #     do_insert = False
+            full_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
+            if full_text.endswith("\n\n"):
+                # we've just started a fresh paragraph → run digit trigger
+                all_ids = input_ids[0].tolist()
+                do_insert, self.last_period_idx = self.check_trigger_from_last_period(
+                    token_ids=all_ids,
+                    min_digits=self.min_digits
                 )
-            )
+            else:
+                do_insert = False
+            
+            # --------------------------
+            # WAIT TOKEN INJECTION LOGIC
+            # --------------------------
 
-            # Optional debug logging
-            # if not should_inject:
-            #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
+            # ---- Wait Injection Logic ----
 
+            # -- Step count --
+            current_step += 1
             generation_ratio = current_step / generation_config.max_new_tokens
 
-            def injection_prob_curve(r: float) -> float:
+            # -- Schedule --
+            def scheduled_injection_prob(r: float) -> float:
                 if r < 0.2:
-                    return 0.1
+                    return 0.01
                 elif r < 0.4:
-                    return 0.3 + 1.0 * (r - 0.2) / 0.2  # ramps up to 1.3
-                elif r < 0.7:
-                    return 1.3  # peak zone
+                    return 0.05
+                elif r < 0.6:
+                    return 0.1
+                elif r < 0.8:
+                    return 0.3
                 elif r < 0.9:
-                    return 1.3 - 0.8 * (r - 0.7) / 0.2  # tapers to 0.5
+                    return 0.6
                 else:
-                    return 0.3  # low again
+                    return 0.9  # near end of generation: very likely to inject
 
-            injection_prob = min(1.0, max(0.0, injection_prob_curve(generation_ratio)))
-            
-            # Adaptive interval: low at the start, tighter in mid/end
-            if generation_ratio < 0.2:
-                wait_injection_interval = 10
-            elif generation_ratio < 0.5:
-                wait_injection_interval = 6
-            else:
-                wait_injection_interval = 3
+            inject_prob = scheduled_injection_prob(generation_ratio)
+            # --- Force higher injection probability at the end if it's been a while since last injection ---
+            near_end = generation_ratio > 0.95
+            long_since_last = input_ids.shape[1] > self.last_injected_idx + 50
 
-            # if generation_ratio < 0.2:
-            #     wait_injection_interval = 6  # low frequency at the beginning
-            # elif generation_ratio < 0.5:
-            #     wait_injection_interval = 3  # increase during reasoning
-            # else:
-            #     wait_injection_interval = 2  # high frequency near the end
-            
-            if generation_ratio < 0.1:
-                wait_injection_interval = 8
-            elif generation_ratio < 0.3:
-                wait_injection_interval = 5
-            elif generation_ratio < 0.6:
-                wait_injection_interval = 3
-            else:
-                wait_injection_interval = 2
-            
-            wait_injection_interval = int(max_interval - (max_interval - min_interval) * (1 - math.exp(-current_step / decay_speed)))
-            # if not should_inject:
-            #     print(f"[Skip] Not injecting at step {current_step}. Segment: {repr(recent_segment[-50:])}")
-            if (
-                not self.stop_injecting and
-                wait_insertions < max_wait_tokens and
-                should_inject and
-                do_insert and
-                (current_step - last_injected_step >= wait_injection_interval)
-            ):
-                if random.random() < injection_prob:
-                    last_injected_step = current_step
-                    self.last_injected_idx = input_ids.shape[1]
+            if near_end and long_since_last:
+                inject_prob = 1.0  # Ensure wait gets injected at least once near the end
 
-                    self.recent_sentences.append(recent_segment)
-                    if len(self.recent_sentences) > 5:
-                        self.recent_sentences.pop(0)
+            # -- Decode the last few tokens --
+            decoded_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            recent_chunk = decoded_text[-150:]
 
-                    extra_ids = self.tokenizer("Wait", add_special_tokens=False).input_ids
-                    extra_tensor = torch.tensor(extra_ids, device=input_ids.device).unsqueeze(0)
-                    # print(f"[Inject] Step {current_step} → Injecting 'Wait' after: {repr(recent_segment[-40:])}")
-                    
-                    input_ids = torch.cat([input_ids, extra_tensor], dim=1)
-                    wait_insertions += 1
-                    clean_segment = recent_segment.strip().lower()
-                    if clean_segment not in self.recent_sentences:
-                        self.recent_sentences.append(clean_segment)
-                        if len(self.recent_sentences) > 5:
-                            self.recent_sentences.pop(0)
-                            
-                    # Forward pass for new token
-                    forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                    if output_attentions: forced_inputs["output_attentions"] = True
-                    if output_hidden_states: forced_inputs["output_hidden_states"] = True
-                    forced_out = model_forward(**forced_inputs, return_dict=True)
+            # -- Basic sentence break check --
+            has_soft_break = any(recent_chunk.strip().endswith(x) for x in [".", ":", "?", "!", "\n"])
 
-                    forced_logits = forced_out.logits[:, -1, :].float()
-                    forced_scores = logits_processor(input_ids, forced_logits)
+            # -- Avoid if inside LaTeX or math block --
+            def is_inside_math(text: str) -> bool:
+                # Count unclosed inline math ($) and display math (\[...\], $$...$$)
+                inline = text.count("$") % 2 != 0
+                display_1 = text.count("\\[") > text.count("\\]")
+                display_2 = text.count("$$") % 2 != 0
+                return inline or display_1 or display_2
 
-                    if output_scores: scores += (forced_scores,)
-                    if output_logits: raw_logits += (forced_logits,)
-                    if output_attentions:
-                        decoder_attentions += (forced_out.attentions if not self.config.is_encoder_decoder else forced_out.decoder_attentions,)
-                    if output_hidden_states:
-                        decoder_hidden_states += (forced_out.hidden_states if not self.config.is_encoder_decoder else forced_out.decoder_hidden_states,)
+            inside_math = is_inside_math(recent_chunk)
 
-                    model_kwargs = self._update_model_kwargs_for_generation(
-                        forced_out, model_kwargs,
-                        is_encoder_decoder=self.config.is_encoder_decoder
-                    )
+            # -- Determine final trigger --
+            cur_idx = input_ids.shape[1]
+            min_spacing = 20
+            # should_inject = (
+            #     has_soft_break and
+            #     not inside_math and
+            #     cur_idx > self.last_injected_idx + min_spacing and
+            #     random.random() < inject_prob
+            # )
+            # -- Final fallback trigger at end of generation --
+            should_force_inject = near_end and long_since_last
 
-                    current_step += 1
-                    continue
+            # -- Final decision: allow either standard or forced injection --
+            should_inject = (
+                (has_soft_break and not inside_math and cur_idx > self.last_injected_idx + min_spacing and random.random() < inject_prob)
+                or should_force_inject
+            )
+            # -- Perform injection --
+            if should_inject:
+                self.last_injected_idx = cur_idx
+                wait_ids = self.tokenizer("Wait", add_special_tokens=False).input_ids
+                wait_tensor = torch.tensor(wait_ids, device=input_ids.device).unsqueeze(0)
+                input_ids = torch.cat([input_ids, wait_tensor], dim=1)
+
+                # Re-run forward pass with Wait injected
+                forced_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+                if output_attentions: forced_inputs.update({"output_attentions": output_attentions})
+                if output_hidden_states: forced_inputs.update({"output_hidden_states": output_hidden_states})
+                forced_out = model_forward(**forced_inputs, return_dict=True)
+
+                forced_logits = forced_out.logits[:, -1, :].float()
+                forced_scores = logits_processor(input_ids, forced_logits)
+
+                if output_scores: scores += (forced_scores,)
+                if output_logits: raw_logits += (forced_logits,)
+                if output_attentions:
+                    attn = forced_out.attentions if not self.config.is_encoder_decoder else forced_out.decoder_attentions
+                    decoder_attentions += (attn,)
+                if output_hidden_states:
+                    hs = forced_out.hidden_states if not self.config.is_encoder_decoder else forced_out.decoder_hidden_states
+                    decoder_hidden_states += (hs,)
+
+                model_kwargs = self._update_model_kwargs_for_generation(
+                    forced_out, model_kwargs,
+                    is_encoder_decoder=self.config.is_encoder_decoder,
+                )
 # ==========================================================
-
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
 
@@ -516,8 +523,6 @@ class DeepSeekQwenModel(Qwen2ForCausalLM):
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
-            # This is needed to properly delete outputs.logits which may be very large for first iteration
-            # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
 
         if streamer is not None:
