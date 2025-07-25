@@ -1,0 +1,8 @@
+Accuracy: 26.26%, Avg Word Count: 2976.36, Self Reflection Ratio: 35.35%
+Accuracy: 42.86%, Avg Word Count: 2425.57, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2400.00, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2432.71, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2422.57, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2424.14, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2441.29, Self Reflection Ratio: 71.43%
+Accuracy: 42.86%, Avg Word Count: 2450.29, Self Reflection Ratio: 100.00%
